@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/gocolly/colly"
 	"github.com/pkg/errors"
 )
 
@@ -21,12 +22,16 @@ func main() {
 // App defines the application's behavior.
 type App struct {
 	Config
+
+	coll *colly.Collector
 }
 
 // NewApp initializes the application.
 func NewApp(conf Config) (*App, error) {
-	app := &App{Config: conf}
-
+	app := &App{
+		Config: conf,
+		coll:   colly.NewCollector(),
+	}
 	return app, nil
 }
 
@@ -38,7 +43,28 @@ func (a *App) Run(ctx context.Context) error {
 	return a.list(ctx)
 }
 
+func (a *App) dl(ctx context.Context, url string) error {
+	a.coll.OnHTML("a[href]", func(e *colly.HTMLElement) {
+		e.Request.Visit(e.Attr("href"))
+	})
+	a.coll.OnRequest(func(r *colly.Request) {
+		fmt.Println("visiting", r.URL)
+	})
+	a.coll.Visit(url)
+
+	return nil
+}
+
 func (a *App) download(ctx context.Context) error {
+	urls, err := a.urls()
+	if err != nil {
+		return errors.Wrap(err, "getting urls")
+	}
+	for _, url := range urls {
+		if err := a.dl(ctx, url); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
