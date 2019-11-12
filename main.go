@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -42,12 +43,44 @@ func (a *App) download(ctx context.Context) error {
 }
 
 func (a *App) list(ctx context.Context) error {
-	return nil
+	urls, err := a.urls()
+	if err != nil {
+		return errors.Wrap(err, "getting urls")
+	}
+	return json.NewEncoder(os.Stdout).Encode(urls)
+}
+
+func (a *App) urls() ([]string, error) {
+	var out []string
+
+	if a.Era != "all" {
+		sections, ok := a.Samples[a.Era]
+		if !ok {
+			return nil, errors.New("unsupported era: " + a.Era)
+		}
+		if len(a.Section) > 0 {
+			urls, ok := sections[a.Section]
+			if !ok {
+				return nil, errors.New("unsupported section: " + a.Section)
+			}
+			out = append(out, urls...)
+		} else {
+			for _, urls := range sections {
+				out = append(out, urls...)
+			}
+		}
+	} else {
+		for _, sections := range a.Samples {
+			for _, urls := range sections {
+				out = append(out, urls...)
+			}
+		}
+	}
+	return out, nil
 }
 
 // Config defines the application's configuration.
 type Config struct {
-	All      bool   `json:"all"`
 	Download bool   `json:"download"`
 	Era      string `json:"era"`
 	Section  string `json:"section"`
@@ -158,9 +191,8 @@ func NewConfig() (Config, error) {
 			},
 		},
 	}
-	flag.BoolVar(&config.All, "a", false, "Download/list all the samples. Defaults to true")
 	flag.BoolVar(&config.Download, "dl", false, "Download samples (default is to just print a JSON list to stdout).")
-	flag.StringVar(&config.Era, "post-2012", false, "Filter by era ('all', 'pre-2012', 'post-2012').")
+	flag.StringVar(&config.Era, "e", "all", "Filter by era ('all', 'pre-2012', 'post-2012').")
 	flag.StringVar(&config.Section, "s", "", "(REQUIRED) Section (e.g. brass, woodwind, percussion")
 	flag.Parse()
 
@@ -168,6 +200,12 @@ func NewConfig() (Config, error) {
 		sections, ok := config.Samples[config.Era]
 		if !ok {
 			return config, errors.New("unsupported era: " + config.Era)
+		}
+		// Validate -s if it was provided.
+		if len(config.Section) > 0 {
+			if _, ok := sections[config.Section]; !ok {
+				return config, errors.New("unsupported section: " + config.Section)
+			}
 		}
 	}
 	return config, nil
