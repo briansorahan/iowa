@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"os"
+	"path"
+	"strings"
 
 	"github.com/gocolly/colly"
 	"github.com/pkg/errors"
@@ -45,7 +49,26 @@ func (a *App) Run(ctx context.Context) error {
 
 func (a *App) dl(ctx context.Context, url string) error {
 	a.coll.OnHTML("a[href]", func(e *colly.HTMLElement) {
-		e.Request.Visit(e.Attr("href"))
+		href := e.Attr("href")
+
+		if strings.HasSuffix(href, ".aif") {
+			fmt.Println("fetching", url+"/"+href)
+
+			resp, err := http.Get(url + "/" + href)
+			if err != nil {
+				panic(err)
+			}
+			defer func() { _ = resp.Body.Close() }() // Best effort.
+
+			data, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				panic(err)
+			}
+			if err := os.MkdirAll(path.Dir(href), os.ModePerm); err != nil {
+				panic(err)
+			}
+			fmt.Println("downloaded", len(data), "bytes")
+		}
 	})
 	a.coll.OnRequest(func(r *colly.Request) {
 		fmt.Println("visiting", r.URL)
