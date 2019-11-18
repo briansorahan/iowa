@@ -4,113 +4,204 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net/http"
+	stdurl "net/url"
 	"os"
 	"path"
 	"strings"
 
-	"github.com/gocolly/colly"
 	"github.com/pkg/errors"
+	"github.com/yhat/scrape"
+
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
 	config, err := NewConfig()
-	die(errors.Wrap(err, "parsing config"))
+	if err != nil {
+		log.Fatal(errors.Wrap(err, "parsing config"))
+	}
 	app, err := NewApp(config)
-	die(errors.Wrap(err, "initializing app"))
-	die(app.Run(context.Background()))
+	if err != nil {
+		log.Fatal(errors.Wrap(err, "initializing app"))
+	}
+	if err := app.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // App defines the application's behavior.
 type App struct {
 	Config
-
-	coll *colly.Collector
 }
 
 // NewApp initializes the application.
 func NewApp(conf Config) (*App, error) {
 	app := &App{
 		Config: conf,
-		coll:   colly.NewCollector(),
 	}
 	return app, nil
 }
 
 // Run runs the application.
-func (a *App) Run(ctx context.Context) error {
-	if a.Download {
-		return a.download(ctx)
+func (app *App) Run(ctx context.Context) error {
+	if app.Download {
+		return app.download(ctx)
 	}
-	return a.list(ctx)
+	return app.list(ctx)
 }
 
-func (a *App) dl(ctx context.Context, url string) error {
-	a.coll.OnHTML("a[href]", func(e *colly.HTMLElement) {
-		href := e.Attr("href")
+func (app *App) contentFetcher(ctx context.Context, download string, dc chan Download) func() error {
+	return func() error {
+		log.Printf("downloading %s", download)
 
-		if strings.HasSuffix(href, ".aif") {
-			fmt.Println("fetching", url+"/"+href)
-
-			resp, err := http.Get(url + "/" + href)
-			if err != nil {
-				panic(err)
-			}
-			defer func() { _ = resp.Body.Close() }() // Best effort.
-
-			data, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				panic(err)
-			}
-			if err := os.MkdirAll(path.Dir(href), os.ModePerm); err != nil {
-				panic(err)
-			}
-			fmt.Println("downloaded", len(data), "bytes")
+		resp, err := http.Get(download)
+		if err != nil {
+			panic(err)
 		}
-	})
-	a.coll.OnRequest(func(r *colly.Request) {
-		fmt.Println("visiting", r.URL)
-	})
-	a.coll.Visit(url)
-
-	return nil
-}
-
-func (a *App) download(ctx context.Context) error {
-	urls, err := a.urls()
-	if err != nil {
-		return errors.Wrap(err, "getting urls")
-	}
-	for _, url := range urls {
-		if err := a.dl(ctx, url); err != nil {
-			return err
+		if resp.StatusCode >= http.StatusMultipleChoices {
+			return errors.New(download + ": " + resp.Status)
 		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case dc <- Download{Content: resp.Body, Location: download}:
+		}
+		return nil
 	}
-	return nil
 }
 
-func (a *App) list(ctx context.Context) error {
-	urls, err := a.urls()
+func (app *App) contentWriter(ctx context.Context, dc chan Download) func() error {
+	return func() error {
+		select {
+		case <-ctx.Done():
+			return nil
+		case download := <-dc:
+			defer func() { _ = download.Content.Close() }() // Best effort.
+
+			u, err := stdurl.Parse(download.Location)
+			if err != nil {
+				return errors.Wrap(err, "parsing url")
+			}
+			if err := os.MkdirAll(path.Dir(u.Path[1:]), os.ModePerm); err != nil {
+				return errors.Wrap(err, "making directory")
+			}
+			f, err := os.Create(u.Path[1:])
+			if err != nil {
+				return errors.Wrap(err, "creating file")
+			}
+			defer func() { _ = f.Close() }() // Best effort.
+
+			log.Printf("writing download to %s", u.Path[1:])
+
+			if _, err := io.Copy(f, download.Content); err != nil {
+				return errors.Wrap(err, "writing file")
+			}
+			log.Printf("wrote %s", u.Path[1:])
+		}
+		return nil
+	}
+}
+
+func (app *App) list(ctx context.Context) error {
+	urls, err := app.urls()
 	if err != nil {
 		return errors.Wrap(err, "getting urls")
 	}
 	return json.NewEncoder(os.Stdout).Encode(urls)
 }
 
-func (a *App) urls() ([]string, error) {
+func (app *App) download(ctx context.Context) error {
+	urls, err := app.urls()
+	if err != nil {
+		return errors.Wrap(err, "getting urls")
+	}
+	for _, url := range urls {
+		// Get the URL's of the actual audio files.
+		downloads, err := app.scrape(ctx, url)
+		if err != nil {
+			return errors.Wrap(err, "scraping audio file URL's")
+		}
+		// Run the downloads in parallel.
+		if err := app.fetch(ctx, downloads); err != nil {
+			return errors.Wrap(err, "fetching audio files")
+		}
+	}
+	return nil
+}
+
+func (app *App) fetch(ctx context.Context, downloads []string) error {
+	var (
+		dc      = make(chan Download)
+		g, gctx = errgroup.WithContext(ctx)
+	)
+	for _, dl := range downloads {
+		// Spawn goroutines that will fetch each file.
+		g.Go(app.contentFetcher(gctx, dl, dc))
+
+		// Spawn goroutines that will write the data to local disk.
+		g.Go(app.contentWriter(gctx, dc))
+	}
+	return g.Wait()
+}
+
+func (app *App) scrape(ctx context.Context, url string) ([]string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetching "+url)
+	}
+	defer func() { _ = resp.Body.Close() }() // Best effort.
+
+	root, err := html.Parse(resp.Body)
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing html")
+	}
+	u, err := stdurl.Parse(url)
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing url")
+	}
+	var (
+		dm    = map[string]struct{}{}
+		links = scrape.FindAll(root, scrape.ByTag(atom.A))
+	)
+	for _, link := range links {
+		for _, attr := range link.Attr {
+			if attr.Key != "href" || !IsAudioFile(attr.Val) {
+				continue
+			}
+			val := attr.Val
+
+			if strings.HasPrefix(attr.Val, "../") {
+				val = attr.Val[3:]
+			}
+			dm["http://"+u.Host+"/"+val] = struct{}{}
+		}
+	}
+	var downloads []string
+
+	for u := range dm {
+		log.Println("going to scrape " + u)
+		downloads = append(downloads, u)
+	}
+	return downloads, nil
+}
+
+func (app *App) urls() ([]string, error) {
 	var out []string
 
-	if a.Era != "all" {
-		sections, ok := a.Samples[a.Era]
+	if app.Era != "all" {
+		sections, ok := app.Samples[app.Era]
 		if !ok {
-			return nil, errors.New("unsupported era: " + a.Era)
+			return nil, errors.New("unsupported era: " + app.Era)
 		}
-		if len(a.Section) > 0 {
-			urls, ok := sections[a.Section]
+		if len(app.Section) > 0 {
+			urls, ok := sections[app.Section]
 			if !ok {
-				return nil, errors.New("unsupported section: " + a.Section)
+				return nil, errors.New("unsupported section: " + app.Section)
 			}
 			out = append(out, urls...)
 		} else {
@@ -119,7 +210,7 @@ func (a *App) urls() ([]string, error) {
 			}
 		}
 	} else {
-		for _, sections := range a.Samples {
+		for _, sections := range app.Samples {
 			for _, urls := range sections {
 				out = append(out, urls...)
 			}
@@ -260,10 +351,16 @@ func NewConfig() (Config, error) {
 	return config, nil
 }
 
-func die(err error) {
-	if err == nil {
-		return
+// Download represents a single audio file download.
+type Download struct {
+	Content  io.ReadCloser
+	Location string
+}
+
+// IsAudioFile returns true if the provided string ends with .aif or .aiff or .wav
+func IsAudioFile(s string) bool {
+	if strings.HasSuffix(s, ".aif") || strings.HasSuffix(s, ".aiff") || strings.HasSuffix(s, ".wav") {
+		return true
 	}
-	fmt.Fprintln(os.Stderr, err.Error())
-	os.Exit(1)
+	return false
 }
