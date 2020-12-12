@@ -51,14 +51,18 @@ func NewApp(conf Config) (*App, error) {
 func (app *App) Run(ctx context.Context) error {
 	if app.Download {
 		return app.download(ctx)
+	} else if app.Validate {
+		return app.validate(ctx)
 	}
 	return app.list(ctx)
 }
 
 func (app *App) contentFetcher(ctx context.Context, download string, dc chan Download) func() error {
 	return func() error {
-		log.Printf("downloading %s", download)
-
+		if _, err := stdurl.Parse(download); err != nil {
+			log.Printf("invalid url: %s", download)
+			return nil
+		}
 		resp, err := http.Get(download)
 		if err != nil {
 			panic(err)
@@ -96,23 +100,12 @@ func (app *App) contentWriter(ctx context.Context, dc chan Download) func() erro
 			}
 			defer func() { _ = f.Close() }() // Best effort.
 
-			log.Printf("writing download to %s", u.Path[1:])
-
 			if _, err := io.Copy(f, download.Content); err != nil {
 				return errors.Wrap(err, "writing file")
 			}
-			log.Printf("wrote %s", u.Path[1:])
 		}
 		return nil
 	}
-}
-
-func (app *App) list(ctx context.Context) error {
-	urls, err := app.urls()
-	if err != nil {
-		return errors.Wrap(err, "getting urls")
-	}
-	return json.NewEncoder(os.Stdout).Encode(urls)
 }
 
 func (app *App) download(ctx context.Context) error {
@@ -139,6 +132,8 @@ func (app *App) fetch(ctx context.Context, downloads []string) error {
 		dc      = make(chan Download)
 		g, gctx = errgroup.WithContext(ctx)
 	)
+	defer close(dc)
+
 	for _, dl := range downloads {
 		// Spawn goroutines that will fetch each file.
 		g.Go(app.contentFetcher(gctx, dl, dc))
@@ -149,7 +144,19 @@ func (app *App) fetch(ctx context.Context, downloads []string) error {
 	return g.Wait()
 }
 
+func (app *App) list(ctx context.Context) error {
+	urls, err := app.urls()
+	if err != nil {
+		return errors.Wrap(err, "getting urls")
+	}
+	return json.NewEncoder(os.Stdout).Encode(urls)
+}
+
 func (app *App) scrape(ctx context.Context, url string) ([]string, error) {
+	u, err := stdurl.Parse(url)
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing url")
+	}
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetching "+url)
@@ -159,10 +166,6 @@ func (app *App) scrape(ctx context.Context, url string) ([]string, error) {
 	root, err := html.Parse(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "parsing html")
-	}
-	u, err := stdurl.Parse(url)
-	if err != nil {
-		return nil, errors.Wrap(err, "parsing url")
 	}
 	var (
 		dm    = map[string]struct{}{}
@@ -184,7 +187,6 @@ func (app *App) scrape(ctx context.Context, url string) ([]string, error) {
 	var downloads []string
 
 	for u := range dm {
-		log.Println("going to scrape " + u)
 		downloads = append(downloads, u)
 	}
 	return downloads, nil
@@ -219,6 +221,26 @@ func (app *App) urls() ([]string, error) {
 	return out, nil
 }
 
+func (app *App) validate(ctx context.Context) error {
+	urls, err := app.urls()
+	if err != nil {
+		return errors.Wrap(err, "getting urls")
+	}
+	for _, url := range urls {
+		// Get the URL's of the actual audio files.
+		downloads, err := app.scrape(ctx, url)
+		if err != nil {
+			return errors.Wrap(err, "scraping audio file URL's")
+		}
+		for _, dl := range downloads {
+			if _, err := stdurl.Parse(dl); err != nil {
+				log.Printf("download url '%s' is invalid", dl)
+			}
+		}
+	}
+	return nil
+}
+
 // Config defines the application's configuration.
 type Config struct {
 	Download bool   `json:"download"`
@@ -229,6 +251,8 @@ type Config struct {
 	// (e.g. brass, percussion, woodwind) to the list of URL's that
 	// contain the sample download links.
 	Samples map[string]map[string][]string `json:"samples"`
+
+	Validate bool `json:"validate"`
 }
 
 // NewConfig parses the application's configuration from env/flags.
@@ -334,6 +358,7 @@ func NewConfig() (Config, error) {
 	flag.BoolVar(&config.Download, "dl", false, "Download samples (default is to just print a JSON list to stdout).")
 	flag.StringVar(&config.Era, "e", "all", "Filter by era ('all', 'pre-2012', 'post-2012').")
 	flag.StringVar(&config.Section, "s", "", "(REQUIRED) Section (e.g. brass, woodwind, percussion")
+	flag.BoolVar(&config.Validate, "validate", false, "Validate the URL of every audio file on the site.")
 	flag.Parse()
 
 	if config.Era != "all" {
